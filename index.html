@@ -2246,11 +2246,13 @@ let metaData = null, metaBudgetsTs = 0, metaAccTs = 0;
 
 async function loadMetaData(showT){
   let errMsg = '';
-  for(const u of ['/api/meta-data']){
+  for(const u of ['/api/meta-data','/api/meta-data']){ // 2 intentos: el 1º puede "despertar" el servidor
     try{
       const r = await fetch(u, {cache:'no-store'});
-      const j = await r.json();
-      if(j && j.error){ errMsg = j.error; continue; }
+      const txt = await r.text();
+      let j = null;
+      try{ j = JSON.parse(txt); }catch(e){ errMsg = 'Meta tardó en responder (HTTP '+r.status+'). Dale ↺ Actualizar en un momento.'; await new Promise(ok=>setTimeout(ok,2000)); continue; }
+      if(j && j.error){ errMsg = j.error; if(j.token_expired) break; continue; }
       if(j && Array.isArray(j.rows)){
         if(Array.isArray(j.accounts) && !META_CUENTAS.length)
           // Solo las cuentas que de verdad pautan (gasto en los últimos 30 días)
@@ -3118,6 +3120,38 @@ function renderMeta(){
   paintMetaUpd();
 }
 
+// ── Mismo producto con distinta promoción = un solo producto (ej. "Bururan Oferta" → "Bururan") ──
+const SHEET_PROD_PROMO = /\b(OFERTAS?|PROMO|PROMOCI[OÓ]N|COMBO|KIT|PACK|X2|X3|2X1|3X2|DESCUENTO|ESPECIAL)\b/gi;
+const _prodCanon = {};
+function pautaProd(r){
+  const raw = String((r && r.producto) || 'Sin producto').trim();
+  const base = raw.replace(SHEET_PROD_PROMO,' ').replace(/\s+/g,' ').trim() || raw;
+  const k = base.toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+  if(!_prodCanon[k]) _prodCanon[k] = base;   // se muestra con el primer nombre que aparezca
+  return _prodCanon[k];
+}
+// ── Tienda de una campaña: el último bloque del nombre es el bot ──
+// "…|CBO|NEXORA" → Nexora Colombia · "…|NEXORA ARG" o "NEXORA ARGENTINA" → Nexora Argentina
+const PAIS_ALIAS = {ARG:'ARG', ARGENTINA:'ARG', COL:'COL', COLOMBIA:'COL', CHL:'CHL', CHILE:'CHL', MEX:'MEX', MEXICO:'MEX',
+  PER:'PER', PERU:'PER', ECU:'ECU', ECUADOR:'ECU', GUA:'GUA', GUATEMALA:'GUA', PAN:'PAN', PANAMA:'PAN'};
+function _tiendaPartes(txt){
+  const w = String(txt||'').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    .replace(/[^A-Z0-9 ]/g,' ').split(/\s+/).filter(x=>x && !/\d/.test(x));
+  let pais = 'COL'; const marca = [];
+  w.forEach(x=>{ if(PAIS_ALIAS[x]) pais = PAIS_ALIAS[x]; else marca.push(x); });
+  return {marca: marca.join(' '), pais};
+}
+function campaignBot(name){
+  const parts = String(name||'').split('|').map(s=>s.trim()).filter(Boolean);
+  return parts.length >= 3 ? parts[parts.length-1] : '';
+}
+function tiendaMatchBot(tienda, bot){
+  if(!bot) return true; // campaña sin bot en el nombre: no se filtra
+  const t = _tiendaPartes(tienda), b = _tiendaPartes(bot);
+  if(!b.marca) return true;
+  return t.pais === b.pais && (t.marca.includes(b.marca) || b.marca.includes(t.marca));
+}
+
 function applyMetaAutofill(date, combos){
   if(!metaData || !Array.isArray(metaData.rows)) return;
   const dayRows = metaData.rows.filter(r=>r.d===date);
@@ -3127,24 +3161,30 @@ function applyMetaAutofill(date, combos){
   dayRows.forEach(r=>{
     const p = prodOfA(metaProductFromCampaign(r.c));
     if(!p) return;
-    if(!metaProd[p]) metaProd[p] = {inv:0, leads:0};
-    metaProd[p].inv += r.s; metaProd[p].leads += r.l;
+    const k = p+'##'+campaignBot(r.c);
+    if(!metaProd[k]) metaProd[k] = {inv:0, leads:0, p, bot:campaignBot(r.c)};
+    metaProd[k].inv += r.s; metaProd[k].leads += r.l;
   });
   const matches = {};
   Object.entries(combos).forEach(([key,c])=>{
-    Object.keys(metaProd).forEach(mp=>{
-      if(prodMatch(c.prod, mp)) (matches[mp] = matches[mp]||[]).push(key);
+    Object.entries(metaProd).forEach(([mk,m])=>{
+      if(prodMatch(c.prod, m.p) && tiendaMatchBot(c.tienda, m.bot)) (matches[mk] = matches[mk]||[]).push(key);
     });
   });
+  // Si varias campañas (producto+bot) caen en la misma tarjeta, se SUMAN
+  const acc = {};
   let changed = false;
   Object.entries(matches).forEach(([mp, keys])=>{
     const totV = keys.reduce((x,k)=>x+combos[k].ventas,0);
     keys.forEach(k=>{
       const share = totV>0 ? combos[k].ventas/totV : 1/keys.length;
-      pautaData[k] = { inv:String(Math.round(metaProd[mp].inv*share)),
-        leads:String(Math.round(metaProd[mp].leads*share)), ts:'auto · Meta API', auto:true };
-      changed = true;
+      acc[k] = acc[k] || {inv:0, leads:0};
+      acc[k].inv += metaProd[mp].inv*share; acc[k].leads += metaProd[mp].leads*share;
     });
+  });
+  Object.entries(acc).forEach(([k,v])=>{
+    pautaData[k] = { inv:String(Math.round(v.inv)), leads:String(Math.round(v.leads)), ts:'auto · Meta API', auto:true };
+    changed = true;
   });
   if(changed) savePautaData();
 }
@@ -3433,7 +3473,7 @@ function renderPauta(){
   const combos = {};
   rows.forEach(r=>{
     const tienda = r.tienda||'Sin tienda';
-    const prod   = r.producto||'Sin producto';
+    const prod   = pautaProd(r);
     const key    = tienda+'||'+prod;
     if(!combos[key]) combos[key]={tienda, prod, ventas:0, valor:0, anuncios:{}};
     combos[key].ventas++;
@@ -3550,8 +3590,8 @@ function recalcPautaCard(key){
   const rows  = allRows.filter(r=>r._d===activeDate);
   const tienda = key.split('||')[0];
   const prod   = key.split('||')[1];
-  const ventas = rows.filter(r=>(r.tienda||'Sin tienda')===tienda&&(r.producto||'Sin producto')===prod).length;
-  const valor  = rows.filter(r=>(r.tienda||'Sin tienda')===tienda&&(r.producto||'Sin producto')===prod).reduce((s,r)=>s+r.valor,0);
+  const ventas = rows.filter(r=>(r.tienda||'Sin tienda')===tienda&&pautaProd(r)===prod).length;
+  const valor  = rows.filter(r=>(r.tienda||'Sin tienda')===tienda&&pautaProd(r)===prod).reduce((s,r)=>s+r.valor,0);
 
   const saved  = pautaData[key]||{};
   const inv    = parseFloat(String(saved.inv||'').replace(/[^0-9.]/g,''))||0;
@@ -3605,7 +3645,7 @@ function renderPautaSummary(){
     .filter(([,d])=>(parseFloat(String(d.inv||'').replace(/[^0-9.]/g,''))||0)>0)
     .map(([k])=>k);
   const ventasConInv = rows.filter(r=>{
-    const k=(r.tienda||'Sin tienda')+'||'+(r.producto||'Sin producto');
+    const k=(r.tienda||'Sin tienda')+'||'+pautaProd(r);
     return keysConInv.includes(k);
   });
   const despConInv = ventasConInv.filter(r=>r.estado==='despachado');
